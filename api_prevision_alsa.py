@@ -64,7 +64,17 @@ CAPACITE_PAR_ERE = {
     "2026_et_plus": {"URB": 90, "REG": 75},
 }
 
-app = FastAPI(title="API Prevision ALSA", version="1.0")
+app = FastAPI(
+    title="API Prevision ALSA",
+    version="1.0")
+
+
+
+@app.get("/")
+def home():
+    return {
+        "message": "Bienvenue dans l'API de prévision ALSA"
+    }
 
 # Autorise le frontend (autre origine/port) a appeler cette API depuis le navigateur
 app.add_middleware(
