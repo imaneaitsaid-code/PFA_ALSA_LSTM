@@ -13,11 +13,13 @@ Arborescence attendue a cote de ce fichier (a copier depuis Drive) :
         synthese_metriques_par_ligne.csv   (contient rotations_par_jour par ligne)
 
 Endpoints :
-    GET /lignes                                            liste des lignes + leurs metriques
-    GET /prevision/{ligne}?date=2026-08-15                  prevision pour une date precise
-    GET /prevision/{ligne}?date_debut=...&date_fin=...      prevision sur un intervalle de dates
-    GET /historique/{ligne}                                 donnees reelles passees (tout l'historique)
-    GET /historique/{ligne}?date_debut=...&date_fin=...     donnees reelles passees, filtrees
+    GET  /lignes                                            liste des lignes + leurs metriques
+    GET  /prevision/{ligne}?date=2026-08-15                  prevision pour une date precise
+    GET  /prevision/{ligne}?date_debut=...&date_fin=...      prevision sur un intervalle de dates
+    GET  /historique/{ligne}                                 donnees reelles passees (tout l'historique)
+    GET  /historique/{ligne}?date_debut=...&date_fin=...     donnees reelles passees, filtrees
+    POST /donnees-quotidiennes                                le backend envoie ici les nouvelles
+                                                                donnees reelles du jour (voir plus bas)
 
 Lancer en local : uvicorn api_prevision_alsa:app --reload --port 8000
 Documentation interactive auto-generee : http://localhost:8000/docs
@@ -28,8 +30,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from datetime import timedelta
+from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from tensorflow.keras.models import load_model
 
 MODELS_DIR = "models"
@@ -64,17 +68,7 @@ CAPACITE_PAR_ERE = {
     "2026_et_plus": {"URB": 90, "REG": 75},
 }
 
-app = FastAPI(
-    title="API Prevision ALSA",
-    version="1.0")
-
-
-
-@app.get("/")
-def home():
-    return {
-        "message": "Bienvenue dans l'API de prévision ALSA"
-    }
+app = FastAPI(title="API Prevision ALSA", version="1.0")
 
 # Autorise le frontend (autre origine/port) a appeler cette API depuis le navigateur
 app.add_middleware(
@@ -89,6 +83,47 @@ _df["ligne"] = _df["ligne"].astype(str)
 _synthese = pd.read_csv(SYNTHESE_PATH) if os.path.exists(SYNTHESE_PATH) else None
 
 _model_cache = {}   # evite de recharger le modele a chaque requete
+
+
+class DonneeJournaliere(BaseModel):
+    """Une ligne de donnees reelles pour UNE ligne de bus, UN jour. C'est ce que le backend\n    envoie chaque jour via POST /donnees-quotidiennes."""
+    date: str = Field(..., description="Format YYYY-MM-DD", examples=["2026-08-15"])
+    ligne: str = Field(..., examples=["12"])
+    passagers: float = Field(..., ge=0)
+    bus: float = Field(..., ge=0)
+    horas: float = Field(..., ge=0, description="Heures cumulees de circulation ce jour-la")
+    type_jour: str = Field(..., description="'LV' (lundi-vendredi), 'S' (samedi), 'D' (dimanche), 'OTROS' (vacances scolaires)")
+    type_ligne: str = Field(..., description="'URB' ou 'REG'")
+
+
+@app.post("/donnees-quotidiennes")
+def ajouter_donnees_quotidiennes(donnees: List[DonneeJournaliere]):
+    """Ajoute (ou met a jour si la date+ligne existe deja) les donnees reelles du jour,
+    envoyees par le backend. PAS de re-nettoyage complet ici (le nettoyage du fichier Excel
+    brut, avec ses multiples onglets, ne se fait qu'une seule fois via le notebook) : on se
+    contente d'inserer ces lignes deja propres directement dans le jeu de donnees utilise
+    pour les previsions."""
+    global _df
+
+    nouvelles = pd.DataFrame([d.model_dump() for d in donnees])
+    nouvelles["date"] = pd.to_datetime(nouvelles["date"])
+    nouvelles["ligne"] = nouvelles["ligne"].astype(str)
+
+    # on remplace les eventuels doublons (meme date+ligne deja presente), sinon on ajoute
+    cle_nouvelles = set(zip(nouvelles["date"], nouvelles["ligne"]))
+    _df = _df[~_df.apply(lambda r: (r["date"], r["ligne"]) in cle_nouvelles, axis=1)]
+    _df = pd.concat([_df, nouvelles], ignore_index=True).sort_values(["ligne", "date"])
+
+    _df.to_csv(DATA_PATH, index=False)   # persiste sur disque, pour survivre a un redemarrage de l'API
+
+    return {
+        "statut": "ok",
+        "nb_lignes_recues": len(nouvelles),
+        "derniere_date_connue_par_ligne": {
+            ligne: str(_df[_df["ligne"] == ligne]["date"].max().date())
+            for ligne in nouvelles["ligne"].unique()
+        },
+    }
 
 
 def _nom_fichier(ligne):
@@ -208,7 +243,7 @@ def _previsions_recursives(ligne, date_fin_cible):
         # et le modele recevrait toujours la meme fenetre -> prediction constante jour apres jour.
         colonnes_essentielles = [c for c in feat.columns if c != "bus"]
         feat = feat.dropna(subset=colonnes_essentielles)
-        derniere_fenetre = feat[FEATURES].iloc[-WINDOW_SIZE:].values
+        derniere_fenetre = feat[FEATURES].iloc[-WINDOW_SIZE:]
         X = scaler.transform(derniere_fenetre)[np.newaxis, :, :]
         y_scaled = modele.predict(X, verbose=0).flatten()[0]
 
