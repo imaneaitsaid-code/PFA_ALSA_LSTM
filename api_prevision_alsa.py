@@ -29,7 +29,8 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from datetime import timedelta
+import requests
+from datetime import datetime, timedelta
 from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +40,7 @@ from tensorflow.keras.models import load_model
 MODELS_DIR = "models"
 DATA_PATH = "data/processed/BD_EXPLOITATION_clean.csv"
 SYNTHESE_PATH = "reports/synthese_metriques_par_ligne.csv"
-WINDOW_SIZE = 14
+WINDOW_SIZE = 30
 
 FEATURES = ['passagers', 'is_vacances', 'is_weekend', 'is_ferie', 'is_eid',
             'jour_0', 'jour_1', 'jour_2', 'jour_3', 'jour_4', 'jour_5', 'jour_6',
@@ -53,15 +54,75 @@ DATES_AID_FITR = ['2024-04-10', '2025-03-31', '2026-03-20']
 DATES_AID_ADHA = ['2024-06-17', '2025-06-07', '2025-06-09', '2026-05-27', '2026-05-28']
 _DATES_AID = pd.to_datetime(DATES_AID_FITR).union(pd.to_datetime(DATES_AID_ADHA))
 
+# --- Calendrier dynamique (feries/Aid/vacances declares cote Java, au-dela de 2026) ---
+JAVA_API_URL = os.environ.get("JAVA_API_URL", "http://localhost:8081")
 
-def _est_ferie(date):
+_cache_evenements = {"donnees": None, "recupere_a": None}
+CACHE_DUREE = timedelta(minutes=10)
+
+
+def _recuperer_evenements():
+    """Va chercher la liste des evenements (feries, Aid, vacances) declares
+    cote Java. Garde le resultat en cache 10 minutes pour ne pas surcharger
+    l'API Java a chaque prediction."""
+    maintenant = datetime.now()
+    cache_valide = (
+        _cache_evenements["donnees"] is not None
+        and maintenant - _cache_evenements["recupere_a"] < CACHE_DUREE
+    )
+    if cache_valide:
+        return _cache_evenements["donnees"]
+
+    try:
+        reponse = requests.get(f"{JAVA_API_URL}/api/evenements", timeout=5)
+        reponse.raise_for_status()
+        evenements = reponse.json()
+    except requests.RequestException as e:
+        print(f"[ATTENTION] Impossible de contacter l'API Java : {e}")
+        # si Java est injoignable, on garde l'ancien cache plutot que de planter
+        return _cache_evenements["donnees"] or []
+
+    _cache_evenements["donnees"] = evenements
+    _cache_evenements["recupere_a"] = maintenant
+    return evenements
+
+
+def _construire_calendrier_dynamique():
+    """Transforme les evenements Java (avec date_debut/date_fin) en 3 ensembles
+    de dates : feries, Aid, vacances. Un evenement peut couvrir plusieurs jours
+    (ex. vacances du 01/07 au 01/09), donc on 'deplie' chaque intervalle."""
+    dates_feries = set()
+    dates_aid = set()
+    dates_vacances = set()
+
+    for ev in _recuperer_evenements():
+        debut = pd.Timestamp(ev["dateDebut"])
+        fin = pd.Timestamp(ev.get("dateFin") or ev["dateDebut"])
+        plage = pd.date_range(debut, fin)
+
+        type_ev = ev.get("typeEvenement", "")
+        titre = ev.get("titre", "").lower()
+
+        if type_ev == "JOUR_FERIE":
+            dates_feries.update(plage)
+            if "aid" in titre or "eid" in titre:
+                dates_aid.update(plage)
+        elif type_ev == "VACANCES":
+            dates_vacances.update(plage)
+
+    return dates_feries, dates_aid, dates_vacances
+
+
+def _est_ferie(date, dates_feries_dyn, dates_aid_dyn):
+    d = date.normalize()
     if (date.month, date.day) in JOURS_FERIES_FIXES:
         return True
-    return date.normalize() in _DATES_AID
+    return d in _DATES_AID or d in dates_feries_dyn or d in dates_aid_dyn
 
 
-def _est_aid(date):
-    return date.normalize() in _DATES_AID
+def _est_aid(date, dates_aid_dyn):
+    d = date.normalize()
+    return d in _DATES_AID or d in dates_aid_dyn
 
 CAPACITE_PAR_ERE = {
     "avant_2026": {"URB": 100, "REG": 90},
@@ -143,12 +204,12 @@ def _charger_modele(ligne):
     return modele, scaler
 
 
-def _ajouter_features(d):
+def _ajouter_features(d, dates_feries_dyn, dates_aid_dyn):
     d = d.copy()
     d["jour_semaine"] = d.index.dayofweek
     d["mois"] = d.index.month
-    d["is_ferie"] = [int(_est_ferie(dt)) for dt in d.index]
-    d["is_eid"] = [int(_est_aid(dt)) for dt in d.index]
+    d["is_ferie"] = [int(_est_ferie(dt, dates_feries_dyn, dates_aid_dyn)) for dt in d.index]
+    d["is_eid"] = [int(_est_aid(dt, dates_aid_dyn)) for dt in d.index]
     d["is_vacances"] = (d["type_jour"] == "OTROS").astype(int)
     # un jour ferie (JF fixe ou Aid) se comporte comme un dimanche, quel que soit le vrai jour
     # de la semaine -> on aligne l'encodage jour_semaine/is_weekend sur dimanche pour ces dates
@@ -220,6 +281,8 @@ def _previsions_recursives(ligne, date_fin_cible):
     type_ligne = historique["type_ligne"].mode()[0]
     rotations = _rotations_par_jour(ligne)
 
+    dates_feries_dyn, dates_aid_dyn, dates_vacances_dyn = _construire_calendrier_dynamique()
+
     derniere_date_connue = historique.index[-1]
     horizon = (date_fin_cible - derniere_date_connue).days
     if horizon < 1:
@@ -237,7 +300,7 @@ def _previsions_recursives(ligne, date_fin_cible):
 
     chemin = []
     for _ in range(horizon):
-        feat = _ajouter_features(historique)
+        feat = _ajouter_features(historique, dates_feries_dyn, dates_aid_dyn)
         # IMPORTANT : on exclut 'bus' du dropna. Les jours predits qu'on ajoute a l'historique
         # n'ont pas de 'bus' connu (NaN) ; un dropna() global les effacerait a chaque iteration,
         # et le modele recevrait toujours la meme fenetre -> prediction constante jour apres jour.
@@ -265,8 +328,9 @@ def _previsions_recursives(ligne, date_fin_cible):
             "bus_recommandes": bus_recommandes,
         })
 
+        type_jour_prochain = "OTROS" if prochaine_date.normalize() in dates_vacances_dyn else "LV"
         historique.loc[prochaine_date] = {
-            "passagers": passagers_predits, "type_jour": "LV",
+            "passagers": passagers_predits, "type_jour": type_jour_prochain,
             "type_ligne": type_ligne, "bus": np.nan,
         }
 
